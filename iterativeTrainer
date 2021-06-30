@@ -1,0 +1,675 @@
+/********************************************************************
+*                                                                   *
+*                 Stratified Training Model                         *
+*                                                                   *
+********************************************************************/
+
+//10m bands
+var bands10 = ["B2", "B3", "B4", "B8"];
+
+//20m bands
+var bands20 = ["B2", "B3", "B4", "B5", "B6", "B7", "B8", "B8A", "B11", "B12"];
+
+//Get a cloud-free image from summer, 2020
+var trainingImage = ee.Image(s2sr
+  .filterBounds(ROI)
+  .filterDate("2020-06-01", "2020-08-30")
+  .sort("CLOUDY_PIXEL_PERCENTAGE")
+  .first());
+  // .select(bands10);
+
+var targetImage = ee.Image(s2sr
+  .filterBounds(target)
+  .filterDate("2020-06-01", "2020-08-30")
+  .sort("CLOUDY_PIXEL_PERCENTAGE")
+  .first());
+
+//Points of mine districts for reference
+var districts = ee.FeatureCollection(districtPoints);
+
+//Bring in tailings for later validation and clean up
+var tailings = ee.FeatureCollection(tailingsNS);
+
+//Clip to mainland
+var tailings = tailings.map(function(feature){
+  return feature.intersection(mainlandNS);
+  });
+  
+//Filter to only gold and only tailings_areas
+//Crushers with no associated tailings areas are coded as Crusher1 = 0. Filter those out
+var tailings = tailings.filter(ee.Filter.eq("Commodity", "Gold"))
+  .filter(ee.Filter.eq("GCODE", "TAILINGS_AREA"))
+  .filter(ee.Filter.neq("Crusher1", "0"));
+
+//Add watershed polygons
+var watersheds = ee.FeatureCollection(watershedTable).map(function(feature)
+    {return feature.intersection(mainlandNS)}
+  ).style({fillColor: "#00000000"});
+    
+//Add field sample points
+// print(tailingsSamples.filter(ee.Filter.eq("tailings", 1)));
+// Map.addLayer(tailingsSamples);
+
+
+/********************************************************************
+*                                                                   *
+*                   Random Forest Function                          *
+*                                                                   *
+********************************************************************/
+
+//Function to train RF classifier
+//Input the image to use in training, the collection of training geometry, and the bands included
+
+var trainingSamples = function(targetImage, features, scale){
+  
+  return targetImage.sampleRegions({
+  collection: features,
+  properties: ["tailings"],
+  scale: scale
+  });
+};
+
+var trainRF = function(trainer, bands){
+  return ee.Classifier.smileRandomForest(15).train({
+    features: trainer, 
+    classProperty: "tailings",
+    inputProperties: bands
+  });
+};
+
+//Function to classify via RF
+//targetImage defaults to training image, or a different image can be classified
+
+var classifyRF = function(trainingImageCollection, features, bands, scale, targetImage){
+  
+  if (targetImage === undefined){
+    targetImage = trainingImageCollection;
+  }
+  
+  //Selects correct bands from image collection
+  var trainingImage = trainingImageCollection.select(bands);
+  
+  //Samples image from geometry
+  var trainer = trainingSamples(trainingImage, features, scale);
+  
+  var classifier = trainRF(trainer, bands);
+  
+  //Second output is for confusion matrix, third is for error matrix
+  return [targetImage.classify(classifier), classifier, trainer]; 
+};
+
+////////////////////////////////////////////////
+//       Random Forest - One Sample           //
+////////////////////////////////////////////////
+
+//Create collection of training polygons (from imports)
+var trainingOneClass = tailingsTraining.merge(notTailingsTraining);
+
+// var oneClassRF = classifyRF(trainingImage, trainingOneClass, bands10, 10);
+// Map.addLayer(oneClassRF[0].selfMask(), {min: 0, max: 1, palette: ["grey", "yellow"]}, "Single Class RF", false);
+
+//Use tailings samples as training
+
+// var trainingOneClassFromSamples = notTailingsTraining.merge(tailingsSamples);
+
+// var oneClassFromSamplesRF = classifyRF(trainingImage, trainingOneClassFromSamples, bands10, 10);
+// Map.addLayer(oneClassFromSamplesRF[0], {min: 0, max: 1, palette: ["grey", "yellow"]}, "Single Class RF From Samples");
+
+
+
+////////////////////////////////////////////////
+//       Random Forest - Multiple Classes     //
+////////////////////////////////////////////////
+
+// //Combine training geometry
+var trainingMultiple = notTailingsTraining.merge(dryTailings).merge(wetTailings);
+
+var multipleClassRF = classifyRF(trainingImage, trainingMultiple, bands20, 20);
+
+Map.addLayer(multipleClassRF[0].selfMask(), {min:0, max: 2, palette:["white","orange", "blue"]}, "Multiple Class RF", false);
+
+
+////////////////////////////////////////////////
+//             Iron Feature Index             //
+////////////////////////////////////////////////
+var calcIFD = function(targetImage){
+  
+  //Set up variables. These are for Sentinel-2 ONLY
+  var red = targetImage.select("B4");
+  var swir = targetImage.select("B11");
+  var nir = targetImage.select("B8");
+  
+  //Break up equation to make order of operations easier
+  var swirDiff = swir.subtract(red);
+  
+  //Takes center wavelength of bands to center iron absorption feature
+  //This math is being done at each pixel, so we need ee.Images with constant values
+  // 865 - 650 / 1610 - 650:
+  var center = ee.Image(835).subtract(ee.Image(650)).divide(ee.Image(1610).subtract(ee.Image(650)));
+  
+  //rInt = r(red) + (r(SWIR1)-r(red)) * lamba(NIR)-lambda(red)/lambda(SWIR1)-lambda(red)
+  var rInt = red.add(swirDiff.multiply(center));
+  
+  return rInt.subtract(nir).rename(["IFD"]);
+};
+
+var IFD = calcIFD(trainingImage);
+//print("IFD:", IFD);
+
+//Add IFD to bands20 and classify
+
+var trainingIFD = trainingImage.addBands(IFD);
+var bands20IFD = bands20.concat("IFD");
+
+var multipleClassIFD = classifyRF(trainingIFD, trainingMultiple, bands20IFD, 20);
+
+//print("IFD RF", multipleClassIFD);
+// Map.addLayer(multipleClassIFD[0].selfMask(), {min: 0, max: 2, palette: ["white", "orange", "blue"]}, "Multiple Classes with IFD", false);
+
+
+/********************************************************************
+*                                                                   *
+*                             Validation                            *
+*                                                                   *
+********************************************************************/
+
+//Validate classification using NS tailings data
+
+///////// Confusion matrix /////////
+
+// var confusionMatrix = multipleClassRF[1].confusionMatrix();
+// print(confusionMatrix.accuracy());
+
+//////// Error matrix /////////
+
+//Create image the dimensions of training image where tailings = 1 and all else = 0
+
+//Convert tailings featurecollection to an image, where tailings have value of 1
+//Also set resolution to that of satellite bands
+
+
+////////////////////////////////////////////////
+//           Validation Data Masks            //
+////////////////////////////////////////////////
+
+//Function that takes tailings features, training image, and bands used and outputs a rasterized image displaying tailings
+//Output image will be the extent and projection of input training image
+var validationImage = function(tailings, image, bands){
+  
+  var projection = image.select(bands).projection();
+  
+  var background = ee.Image(0)
+  .reproject(projection)
+  .reduceResolution(ee.Reducer.max()) //Reducer doesn't matter (all 0's anyway), we're just changing resolution
+  .clip(image.geometry());
+  
+  var tailingsProp = tailings.map(function(f){
+    return f.set("tailings", 1);
+  });
+  
+  var tailingsImage = tailingsProp.reduceToImage(["tailings"], ee.Reducer.max())
+  .reproject(projection);
+  
+  //Where tailings image (excluding No Data) is not 0, replace background pixels with value of 1
+  return background.where(tailingsImage.eq(1), tailingsImage);
+};
+
+var validationImage = validationImage(tailings, trainingImage, bands10);
+
+
+//Function to mask vegetation or water out of tailings validation image
+var maskTailings = function(validationImage, differenceIndex, threshold){
+  //Pass in validation image, difference index image (of same extent) and set a difference index threshold for masking
+  //Return an image where value of 1 shows where pixel is BELOW threshold
+
+  return validationImage.updateMask(differenceIndex.lte(threshold)); //.lte sets values below threshold to 1
+};
+
+//Projection based on bands used
+var projection10 = trainingImage.select(bands10).projection();
+
+//Calculate NDVI
+var NDVI = trainingImage.normalizedDifference(["B8", "B4"]).reproject(projection10);
+
+var maskVeg = maskTailings(validationImage, NDVI, 0.5);
+// Map.addLayer(NDVI, {min: -1, max: 1, palette: ["brown", "green"]}, "NDVI", false);
+
+//Mask water
+//Try with NDWI - TODO: Try with water features or classified water
+var NDWI = trainingImage.normalizedDifference(["B3", "B8"]).reproject(projection10);
+
+var waterMask = maskTailings(validationImage, NDWI, 0.0);
+// Map.addLayer(NDWI, null, "NDWI", false);
+
+//Combine masks
+var maskedValidation = waterMask.multiply(maskVeg); //Rasterized training area with vegetated and wet pixels removed
+
+
+/********************************************************************
+*                                                                   *
+*                 Iterative Sampler/Validator                       *
+*                                                                   *
+********************************************************************/
+
+//TODO: Create function to randomly sample points from prov. tailings, setting some aside for validation -- DONE
+//TODO: Classify random sample points -- DONE
+  //TODO: Exclude districts with no tailings from training set
+  //TODO: Stratify non-tailings training by S2's classification band -- DONE
+//TODO: Validate points
+
+//Convert masked tailings to feature collection
+var createValidationRaster =  function(tailingsMasked, trainingImage, bands){
+  
+  var projection = trainingImage.select(bands).projection();
+  
+  var background = ee.Image(0)
+  .reproject(projection)
+  .reduceResolution(ee.Reducer.max()) //Reducer doesn't matter (all 0's anyway), we're just changing resolution
+  .clip(trainingImage.geometry()); //Image has one band, called "tailings"
+    
+  //Where tailings image (excluding No Data) is not 0, replace background pixels with value of 1
+  return background.where(tailingsMasked.eq(1), ee.Image(1)).rename("tailings"); //There's only one band, called "tailings"
+};
+
+var validationRaster = createValidationRaster(maskedValidation, trainingImage, bands10);
+
+////////////////////////////////////////////////
+//         Select Districts and Buffer        //
+////////////////////////////////////////////////
+
+//Function to remove any districts within training image that don't contain any tailings, according to validation image
+var clearEmptyTailings = function(districts, validationRaster, scale){
+  
+  //Buffer all districts by 2.5km
+  var distBuff = districts.map(function(f){
+   return f.buffer(2500);
+  });
+  
+  //Create a vector of validation raster where tailings = 1
+  var tailingsVector = validationRaster.selfMask().reduceToVectors({
+  reducer: ee.Reducer.countEvery(),
+  geometry: trainingImage.geometry(),
+  scale: scale,
+  maxPixels: 1e12});
+
+  //If buffer intersects tailings vector, keep it. I.e., if there is at least 1 tailings pixel inside buffer
+  var distTailingsIntersect = distBuff.filter(ee.Filter.bounds(tailingsVector));
+  
+  var distWithTailings = distTailingsIntersect.map(function(f){
+    
+    //take centroid of each district (should be exact same as districts before buffer)
+    return f.centroid();
+    
+  });
+  
+  return ee.FeatureCollection(distWithTailings);
+};
+
+var districtsCleared = clearEmptyTailings(districts, validationRaster, 20); //replace 20 with "scale" variable
+
+// print(districtsCleared, "is not empty");
+
+//Returns a raster of training image, clipped to an area around districts
+var subsetDistricts = function(trainingImage, districtsCleared, scale, seed){
+  
+  //Function to add random column to district features and buffer
+  //randomize creates a training set containing 80% of districts and val set with 20%
+  //after Monte Carlo 80:20 method in Lyons et al 2018.
+  var randomize = function(){
+        
+    var districtsRand = districtsCleared.randomColumn("random", seed); //seed will be pulled from outer function, otherwise set before using subsetDistricts
+  
+    //For quickly changing the train/test ratio
+    var split = ee.Number(0.8);
+  
+    //Create district buffer of 2.5km, split into training and validation
+    return [
+      districtsRand.filter(ee.Filter.lte("random", split)).map(function(f){return f.buffer(2500)}),
+      districtsRand.filter(ee.Filter.gt("random", split)).map(function(f){return f.buffer(2500)})
+      ];
+  
+  };
+    
+  //Produce a list, containing [trainingData, testData]
+  var districtsBuffered = randomize();
+  
+  //Return a list of two feature collections, training and test data, buffered
+  return districtsBuffered;
+  
+  // .map(function(fc){
+  //   return trainingImage
+  //   .clip(fc)
+  //   .reproject({
+  //     crs: trainingImage.select("B2").projection(),
+  //     scale: scale
+  //   });
+  // });
+};
+
+//Remove buffered areas from SCL band to reduce autocorrellation
+var sclTrainingArea = function(trainingImage, distBuffers){
+ 
+ //Scene Classification Layer Band 
+  var sclBand = trainingImage.select("SCL");
+ 
+ //Where district buffer exists (is not 0), replace SCL pixels with value of 0 (0 reserved for not classified)
+ //Add that image to training image as a new band
+  var masked = sclBand.where(distBuffers.select("B2"), ee.Image(0)); //"B2" is arbitrary. Can be any band that is never 0 (probably a better option)
+ 
+  return trainingImage.addBands(masked, ["SCL"], true);
+  
+};
+
+//DEBUG TEST//
+
+// var districtsWithTailings = clearEmptyTailings(districts, validationRaster);
+
+// var subsetTest = subsetDistricts(trainingImage, districtsWithTailings, 20, ee.Number(Math.random() * 1000).floor());
+// print(subsetTest, "subset districts");
+// Map.addLayer(subsetTest[0].select("B2"), {palette: "blue"}, "training subset");
+// Map.addLayer(subsetTest[1].select("B2"), {palette: "red"}, "testing subset");
+
+////////////////////////////////////////////////////////////
+//   Random Strat Classifier - Generate Training Points   //
+////////////////////////////////////////////////////////////
+
+var randomStratTrainingPoints = function(trainingImage, validationRaster, bands, scale, targetImage){
+   
+  //Gets percentage of land cover from S2's SCL band, in pixels. For use when sampling later
+  var sampleProportions = function(){
+    
+    var classPixelCount = classVals.map(function(classVal){
+      
+      //Return a list of the number of pixels in each class
+      return trainingImage.select("SCL").eq(ee.Number(classVal)).selfMask()
+              .reduceRegion({reducer: ee.Reducer.count(), scale: scale, maxPixels: 1e9})
+              .get("SCL");
+      
+    });
+      
+    var totalPixels = classPixelCount.reduce(ee.Reducer.sum());
+    
+    return ee.List(classPixelCount.map(function(count){
+      
+      return ee.Number.expression(
+        "(classCount/totalPixels)", 
+        {
+        "classCount": count,
+        "totalPixels": totalPixels
+        });
+    }));
+  };
+   
+  //Set new seed each iteration for randomizing
+  var seed = ee.Number(Math.random()*1000).floor();
+  
+  //Create subset of districts
+  //Clear districts that don't contain any tailings pixels
+  var districtsClear = clearEmptyTailings(districts, validationRaster, 20);
+  //Split subset districts into training and test sets. Retuns a list
+  var districtSubset = subsetDistricts(trainingImage, districtsClear, scale, seed);
+      
+  //Split up the randomly selected districts
+  //Clip training image to trainingArea
+  var trainingArea = trainingImage
+        .clip(districtSubset[0])
+        .reproject({
+          crs: trainingImage.select("B2").projection(),
+          scale: scale
+      });
+  
+  var testingArea = trainingImage
+        .clip(districtSubset[1])
+        .reproject({
+          crs: trainingImage.select("B2").projection(),
+          scale: scale
+      });
+  
+  //For collecting validation points from sampleRegions later
+  var testingVector = districtSubset[1];
+  
+  // print(trainingArea, "trainingArea") //DEBUG
+  // print(testingArea, "testingArea") //DEBUG
+
+    
+  //Show train/test districts
+  // Map.addLayer(districtSubset[0].select("B2"), {palette: "blue"}, "Training Districts", false);
+  // Map.addLayer(districtSubset[1].select("B2"), {palette: "red"}, "Test Districts", true);
+
+  // Map.addLayer(trainingArea.select("B2"), {palette: "blue"}, "training area", false); //DEBUG
+  // Map.addLayer(testingArea.select("B2"), {palette: "red"}, "testing area", false); //DEBUG
+
+  //Image of classified land cover with districts removed
+  //sclTrainingArea is run twice to remove both training and test districts
+  var nonDistrictArea = sclTrainingArea(sclTrainingArea(trainingImage, testingArea), trainingArea);
+  // Map.addLayer(nonDistrictArea.select("SCL"), {min:1, max: 9}, "non district training area"); //DEBUG
+  
+  var classVals = ee.List.sequence(1,9);
+  var totalPoints = ee.Number(1000);
+  var classPoints = sampleProportions()
+      .map(function(num){return ee.Number(num).multiply(totalPoints).floor()}); //Splits 1000 sample points proportionally based on class area
+  
+  // print(classPoints); //DEBUG
+  
+  //Stratify within non-tailings area to ensure all classes represented
+  var nonTailings = nonDistrictArea.stratifiedSample({
+      numPoints: totalPoints,
+      region: nonDistrictArea.clip(mainlandNS).geometry(), //Removes lots of ocean area
+      scale: scale,
+      seed: seed, //Randomize points each iteration
+      classBand: "SCL",
+      classValues: classVals, //4,5,6 are veg, bare soil, water. Refer to S2 MSI Level-2A doc for full list of SCL classes. 
+      classPoints:  classPoints //Number of points in each class. Determeined by proportion of classes in full image
+      });
+    
+  //Take random sample of tailings pixels (from validation raster) from within district subset
+  var tailings = trainingArea.stratifiedSample({
+    numPoints: 0, //Overridden by classPoints
+    region: trainingImage.geometry(),
+    scale: scale,
+    seed: seed,
+    classBand: "tailings",
+    classValues: [0, 1],
+    classPoints: [0, 100],
+    dropNulls: true
+  });
+  
+  //Return a dictionary of training points, the trainingImage clipped by districts, and the vector of testing districts
+  return {trainingPoints: tailings.merge(nonTailings), testingArea: testingArea, testingVector: testingVector};
+  
+};
+
+///////////////////////////////////////////////////////////
+//   Random Stratified Classifier Iterator - Function    //
+///////////////////////////////////////////////////////////
+
+var randomStratClassifierIterator = function(times, trainingImage, validationRaster, bands, scale, targetImage){
+  
+  //TODO: Create list to collect accuracy statistics
+    //TODO: Verify using test set
+  
+  var seed = ee.Number(Math.random() * 1000).floor();
+      
+  //Add tailings bands (0 or 1) to training image
+  trainingImage = trainingImage.addBands(validationRaster.rename("tailings"));
+  
+  //Target image defaults to training image if not provided
+  if(targetImage === undefined){
+  
+    targetImage = trainingImage;
+  
+  }
+      
+  //Create a list containing 'times' number of training sample points, then classify target image based on each sample
+  //sampleData is a list containing dictionaries with 2 keys: trainingData (points) and testingArea (image)
+  var sampleData = ee.List.sequence(1, times)
+      .map(function(n){
+        
+        //Returns "trainingPoints", "testingArea", "testingVector" 
+        return ee.Dictionary(randomStratTrainingPoints(trainingImage, validationRaster, bands, scale, targetImage));
+    
+      });
+      
+  // print(ee.Dictionary(ee.List(sampleData).get(0)).get("trainingPoints"), "training points"); //DEBUG
+  // print(ee.Dictionary(ee.List(sampleData).get(0)).get("testingArea"), "testing area"); //DEBUG
+  // print(ee.Dictionary(ee.List(sampleData).get(0)).get("testingVector"), "testing vector"); //DEBUG
+
+  //Classify points in list and add to a new list
+  //creating a list of lists and I don't know why. Using flatten() to fix
+  
+  //Go through each item in sampleData to populate classified and testing points lists
+  // var classifySamplePoints = ee.List([]);
+  
+  var classifySamplePoints = ee.List(sampleData.map(function(sampleSet){
+    
+    seed = ee.Number(Math.random() * 1000).floor();
+    
+    sampleSet = ee.Dictionary(sampleSet);
+    // print(sampleSet, "sample set")
+    
+    var trainingPoints = ee.FeatureCollection(sampleSet.get("trainingPoints"));
+    var testingArea = ee.Image(sampleSet.get("testingArea"));
+    
+    var classifier = ee.Classifier.smileRandomForest({
+      numberOfTrees: 250,
+      seed: seed
+      }).train({
+      features: trainingPoints,
+      classProperty: "tailings",
+      inputProperties: bands});
+    
+    var classifiedImage = targetImage.classify(classifier).addBands(validationImage.rename("tailings"));
+    
+    var testingAreaPointsSample = classifiedImage.sampleRegions({
+      collection: ee.FeatureCollection(sampleSet.get("testingVector")),
+      scale: scale,
+      });
+    
+    //Return list of classified images      
+    return [classifiedImage, testingAreaPointsSample];
+  }));
+  
+  // print(classifySamplePoints) //DEBUG
+  // print(classifySamplePoints.map(function(lst){return ee.Image(ee.List(lst).get(0)).select("classification")}), "classification images")  
+  // print(classifySamplePoints.map(function(lst){return ee.FeatureCollection(ee.List(lst).get(1))}), "sample points")
+  // print(classifySamplePoints.filter(ee.Filter.hasType({leftField: "type", rightValue: ee.Image()})), "class sample points")
+  
+  //Unpack classified images
+  var classificationColl = classifySamplePoints.map(function(obj){
+    
+    var classImage = ee.Image(ee.List(obj).get(0));
+    
+    //Remove "tailings" layer
+    classImage = classImage.select("classification");
+    
+    return classImage;
+    
+    });
+  
+  //Unpack test points
+  var testPoints = ee.List(classifySamplePoints.map(function(obj){
+    
+    var points = ee.FeatureCollection(ee.List(obj).get(1));
+    
+    return points;
+    
+    //Adding error matrix at this stage seems to be causing "invalid JSON" error later. Move error matrix out of this function to free up the rest
+    // return points.errorMatrix({actual: "tailings", predicted: "classification", order: [0,1]});
+    
+    })
+  );
+
+  // print(classificationColl, "classification coll"); //DEBUG
+  // print(errorMatrices.get(0), "error matrices"); //DEBUG
+
+  //Return a dictionary containing a list of the classified images and their corresponding error matrices  
+  return ee.Dictionary({classifiedCollection: ee.ImageCollection.fromImages(classificationColl), testPoints: testPoints});
+
+};
+
+var testRandomStrat = randomStratClassifierIterator(100, trainingImage, validationRaster, bands20, 20, targetImage);//times, trainingImage, validationRaster, bands, scale, targetImage
+
+//Unpack classified images
+var classColl = testRandomStrat.get("classifiedCollection");
+// print(classColl, "class coll") //DEBUG
+
+//Create image from median classified value
+var classMedian = ee.ImageCollection(classColl).reduce(ee.Reducer.median(2));
+// print(classMedian, "class median") //DEBUG
+Map.addLayer(classMedian.selfMask(), {min: 0, max: 1, palette: ["white", "brown"]}, "Classification Median");
+
+//Unpack test points and produce error matrices
+var testPoints = ee.List(testRandomStrat.get("testPoints"));
+
+//Setting iterations too high causes "invalid JSON" error. Try exporting.
+var errorMatrices = ee.List(testPoints).map(function(points){
+  
+  var pointColl = ee.FeatureCollection(points);
+  
+  return pointColl.errorMatrix("tailings", "classification");
+  
+});
+/********************************************************************
+*                                                                   *
+*                    Accuracy and Validation                        *
+*                                                                   *
+********************************************************************/
+
+// var randomStratValOnly = randomStratClassifierIterator(5, trainingImage, validationRaster, bands20, 20, targetImage);
+// var randomStratValOnlyClassified = randomStratValOnly.reduce(ee.Reducer.median(2)); //times, trainingImage, validationRaster, bands, scale, targetImage
+
+// var valDistrictsColl = randomStratValOnlyClassified.reduceToVectors({
+//   reducer: ee.Reducer.countEvery(),
+//   scale: 20,
+//   geometry: trainingImage.geometry(),
+//   bestEffort: true});
+  
+// var valPoints = randomStratValOnlyClassified.addBands(validationBand.rename("tailings"))
+//                   .sampleRegions({collection:, 
+//                   properties, scale, projection, tileScale, geometries})
+
+  
+// print(valDistrictsColl);
+  
+// print(randomStratValOnlyClassified, "Random Strat Validation - 5 Loops");
+// Map.addLayer(randomStratValOnlyClassified.selfMask(), {min:0, max: 1, palette: ["brown"]}, "Random Strat Val Only - 5 Loops");
+
+// var tailingsValCount = maskedValidation.reduceRegion({
+//   reducer: ee.Reducer.sum(),
+//   maxPixels: 1e9,
+//   scale: 20
+//   });
+  
+// var tailingsClassCountFive = testRandomStrat5.eq(1).reduceRegion({
+//   reducer: ee.Reducer.sum(),
+//   maxPixels: 1e9,
+//   scale: 20,
+//   geometry: trainingImage.geometry()
+//   });
+  
+// var tailingsClassCountFifty = testRandomStrat50.eq(1).reduceRegion({
+//   reducer: ee.Reducer.sum(),
+//   maxPixels: 1e9,
+//   scale: 20,
+//   geometry: trainingImage.geometry()
+//   });
+
+// print(tailingsValCount, "val count");
+// print(tailingsClassCountFive, "class count five loops");
+// print(tailingsClassCountFifty, "class count fifty loops");
+
+/********************************************************************
+*                                                                   *
+*                             Map Layers                            *
+*                                                                   *
+********************************************************************/
+
+// Map.centerObject(validationIntersect, 13);
+Map.addLayer(trainingImage, {bands:["B4", "B3", "B2"], min:300, max:2500}, "Sentinel-2 SR", false);
+// Map.addLayer(tailings.style({color: "fbfb0430"}), null,  "Tailings Features", false);
+// Map.addLayer(districts.style({color:"red"}), null, "Districts", false);
+// Map.addLayer(multipleClassRF[0].selfMask(), {min:0, max: 2, palette:["white","orange", "blue"]}, "Multiple Class RF", false);
+Map.addLayer(targetImage, {bands:["B4", "B3", "B2"], min:300, max:2500, opacity: 0.4}, "Sentinel-2 Target Image", false);
+// Map.addLayer(watersheds, null, "Watersheds", false);
+Map.addLayer(validationRaster.selfMask(), {min:0, max: 1, palette: ["white", "tan"]}, "Tailings Masked", false);
+// Map.addLayer(trainingImage.select("SCL"), {min: 1, max: 11}, "s2 classified", false);
