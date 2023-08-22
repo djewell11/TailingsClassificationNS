@@ -12,8 +12,6 @@
 /* This model is intended to sample Sentinel-2 surface reflectance imagery and classify it to indicate waste from
 historic gold mines. Model is trained on data from the NS Mine Tailings Database.
 
-This model uses a random forest classifier*/
-
 /*********************************************
 *                                            * 
 *    Initialize Variables and Load Assets    *
@@ -27,7 +25,7 @@ This model uses a random forest classifier*/
 //These parameters will determine behaviour of model
 
 //How many times sampler/classifier will loop
-var iterations = 50;
+var iterations = 5;
 
 //Change scale if changing bands. Should only be 10 or 20.
 var scale = 20;
@@ -48,9 +46,9 @@ var useBestBands = true;
 
 //Use random districts, or the target districts below
 //Randomizes for EACH iteration - monte carlo cross-validation (see Lyons et al, 2018)
-var randomDistricts = true;
+var randomDistricts = false;
 //List of districts that will be used if not random
-var targetDistrictNames = ee.List(["Goldenville"]);
+var targetDistrictNames = ee.List(["Montague"]);
 
 //Use custom-drawn polygon
 var userTargetArea = false;
@@ -62,7 +60,7 @@ var b = 1;
 
 // Thresholds for masking vegetation and water in pixels
 var vegetationThreshold = 0.6;
-var waterThreshold = -0.4;
+var waterThreshold = 0.0;
 
 // Parameter Dictionary for Records
 var parameterDictionary = ee.Dictionary({
@@ -95,17 +93,14 @@ var trainingImage = s2sr
 var mainlandNS = ee.Feature(mainlandNS);
 
 //Clip training image to mainland
-var trainingImage = trainingImage.clip(mainlandNS);
+trainingImage = trainingImage.clip(mainlandNS);
 
-//Import DEM
-var DEM = ee.ImageCollection(DEM)
-  .filterBounds(mainlandNS.geometry());
-  
 //Radius of buffered circle around districts in meters
 var districtBufferDistance = 2500;
 
 //A list of seeds for various server-side uses
-var seedList = ee.List.sequence({start: 0, count: 1000}).shuffle({seed: ee.Number(Math.random() * 1000).floor()});
+// var seedList = ee.List.sequence({start: 0, count: 1000}).shuffle({seed: ee.Number(Math.random() * 1000).floor()});
+var seedList = ee.List.sequence({start: 0, count: 1000}).shuffle({seed: 5283});
 
 //////////////////////////////////////////////
 //                Band Sets                 //
@@ -177,17 +172,17 @@ trainingImage = trainingImage.select(bands);
 //////////////////////////////////////////////
 
 /* Original data from the NS Mine Tailings Database (from E. W. Hennick and J. C. Poole, 2020).
- * This data is filtered to show only tailings fields from gold mines in mainland NS. */
+ * This data is filtered to show only tailings areas from gold mines in mainland NS. */
 
-//Cast imported asset to a feature collection 
+// Cast imported asset to a feature collection 
 var tailings = ee.FeatureCollection(tailingsNS);
 
-//Clip to only mainland NS
+// Clip to only mainland NS
 tailings = tailings.map(function(f){
   return f.intersection(mainlandNS);
 });
 
-//Filter to only tailings from gold mines
+// Filter to only tailings from gold mines
 tailings = tailings.filter(ee.Filter.and(
   ee.Filter.eq("Commodity", "Gold"), 
   ee.Filter.eq("GCODE", "TAILINGS_AREA"), 
@@ -196,33 +191,33 @@ tailings = tailings.filter(ee.Filter.and(
 // print(tailings, "Tailings Feature Collection");
 Map.addLayer(tailings.draw({color: "Grey", strokeWidth: 1}), null, "Tailings Database Polygons");
 
-//Convert tailings features to a raster image
+// Convert tailings features to a raster image
 function CreateTailingsImage(tailings, image){
   
-  //Create a background image with value of 0 and reduce its resolution to match lowest of input bands
+  // Create a background image with value of 0 and reduce its resolution to match lowest of input bands
   var background = ee.Image(0)
     .reproject(projection)
     .clip(image.geometry()); //Created background image is boundless. Clip to input (training image) extent
   
-  //Give each tailings feature a property, "tailings", with value = 1
+  // Give each tailings feature a property, "tailings", with value = 1
   var tailingsWithProperty = tailings.map(function(f){return f.set("tailings", 1);});
   
-  //Convert tailings features to an image (raster)
+  // Convert tailings features to an image (raster)
   var tailingsImage = tailingsWithProperty.reduceToImage(["tailings"], ee.Reducer.max()) //Reducer max takes highest value (0 or 1)
     .reproject(projection)
     .reduceResolution(ee.Reducer.mean());
   
-  //Where tailings image (excluding No Data) is not 0, replace background pixels with value of 1
+  // Where tailings image (excluding No Data) is not 0, replace background pixels with value of 1
   return background.where(tailingsImage.eq(1), tailingsImage)
     .reproject(projection) 
     .rename("tailings")
-    .eq(1); //Quickly changes bit depth to [0,1]
+    .eq(1); //Quickly changes range to [0,1]
 }
 
 var tailingsImage = CreateTailingsImage(tailings, trainingImage);
 
 // print(tailingsImage, "Tailings Image")
-// Map.addLayer(tailingsImage)
+  // Map.addLayer(tailingsImage)
 
 //Rename "DistrictNa" property of districtPoints
 districtPoints = districtPoints.map(function(f){
@@ -282,7 +277,7 @@ Map.addLayer(vegetationMask, {min: 0, max: 1, palette: ["green", "brown"]}, "Veg
 Map.addLayer(waterMask.eq(0).selfMask(), {min: 0, max: 1, palette: ["blue", "brown"]}, "Water Mask", false);
 
 //Images used for vegetation mask:
-Map.addLayer(ndvi, {palette: ["brown", "green"], min: -1, max: 1}, "NDVI", false)
+Map.addLayer(ndvi, {palette: ["brown", "green"], min: -1, max: 1}, "NDVI", false);
 
 //Image used for water mask:
 Map.addLayer(mndwi, {palette: ["brown", "blue"]}, "MNDWI", false);
@@ -351,11 +346,42 @@ function ClassifyFromSamples(points, variables){
     .eq(1) //sets bitdepth to 1
     .set("seed", classifierSeed); //Seed is attached for later use.
     
-  //Mask results to remove water and vegetated areas. maskList is set in mask section.
-  // classifiedImage = ApplyMasks(classifiedImage, vegetationMask, waterMask);
-  
   //Return a classified image. 
   return classifiedImage;
+}
+
+// To show what variables were used in classification
+function ClassifyFromSamples_SchemaTest(points, variables){
+  
+  points = ee.Dictionary(points);
+  variables = ee.List(variables);
+  var testingVector = ee.FeatureCollection(points.get("districtVector"));
+  var classificationArea = trainingImage.clipToCollection(testingVector);
+  
+  //Get a new seed each time
+  //points contains a "seed" property
+  var classifierSeed = ee.Number(points.get("seed"));
+  
+  //Unpack feature collections from dictionary
+  var tailingsPoints = ee.FeatureCollection(points.get("tailingsPoints"));
+  var nonTailingsPoints = ee.FeatureCollection(points.get("nonTailingsPoints"));
+  
+  //Combine all points to train classifier
+  var trainingPoints = nonTailingsPoints.merge(tailingsPoints);
+  
+  //Random Forest
+  var classifier = ee.Classifier.smileRandomForest({
+    numberOfTrees: 250,
+    seed: classifierSeed
+  })
+    .train({
+      features: trainingPoints,
+      classProperty: "tailings",
+      inputProperties: variables
+  });
+  
+  var classifierSchema = classifier.schema();
+  return classifierSchema;
 }
 
 //Get Variable Importance
@@ -429,6 +455,54 @@ function AggregateImportance(listOfVarImportance){
 
   return VIFromList;
 }
+
+// Mean spectra per district
+// Input Feature Collection of districts and bands, return FC of means
+// Image must include tailings
+function MeanDistrictTailingsSpectra(districtsFC, image, bands){
+  
+  districtsFC = ee.FeatureCollection(districtsFC);
+  image = ee.Image(image);
+  // Remove SCL. Could remove tailings as well, but it works for QC
+  bands = ee.List(bands).filter(ee.Filter.inList("item", ["SCL"]).not());
+  
+  // Mask by tailings pixels
+  var tailingsImage = image.updateMask(image.select("tailings").eq(1));
+  
+  // Sample from each district
+  var spectralMeans = districtsFC.map(function(district){
+    
+    district = ee.Feature(district);
+    var districtName = district.get("ShortName");
+    
+    var districtSample = tailingsImage.sample({
+      region: district.geometry(), 
+      scale: scale,
+      projection: projection,
+      factor: 0.1,
+      dropNulls: true});
+    
+    // Get mean for each band as features
+    var bandMeans = bands.map(function(band){
+      band = ee.String(band);
+      var bandMean = districtSample.aggregate_mean(band);
+      return bandMean;
+    });
+    
+    // Combine bands and band means into a dictionary
+    var featureProperties = ee.Dictionary.fromLists(bands, bandMeans)
+      .set("District", districtName); //Add district name
+    
+    // Return feature collection from list of features
+    return ee.Feature(null, featureProperties);
+    
+  });
+    
+  return spectralMeans;
+  
+}
+
+
 
 /*********************************************
 *                                            * 
@@ -733,7 +807,7 @@ function CollectTrainingPoints(bands, seed, districtSubsetDictionary){
   var tailingsTrainingRegion = trainingImage.geometry().difference(testingVector);
   //Adjust sample count by total available pixels
   //Take 2/3 of tailings pixels
-  var tailingsPoints = GetSampleCount(maskedTailings.selfMask(), tailingsTrainingRegion, 0.66);
+  var tailingsPoints = GetSampleCount(maskedTailings.selfMask(), tailingsTrainingRegion, 0.33);
   var tailingsClassPoints = ee.List([0, tailingsPoints]); 
   
   var tailingsSample = trainingImage.stratifiedSample({
@@ -786,7 +860,6 @@ var samplePointsSetRandom = ee.List.sequence({start: 0, count: iterations}).map(
 });
 
 //Based on boolean variable set at top, one of these will be called
-//TODO: When testing, these should be fixed, even if the districts chosen are random
 if(!randomDistricts){
   var samplePointsSet = samplePointsSetFixed;
 } else{
@@ -794,8 +867,8 @@ if(!randomDistricts){
 }
 
 //Some tests to show that each list entry is unique (turn on geometries in sample function)
-Map.addLayer(ee.FeatureCollection(ee.Dictionary(ee.List(samplePointsSet).get(0)).get("nonTailingsPoints")), {color: "red"}, "Non tailings points", false);
-Map.addLayer(ee.FeatureCollection(ee.Dictionary(ee.List(samplePointsSet).get(0)).get("tailingsPoints")), {color: "green"}, "Training points", false);
+// Map.addLayer(ee.FeatureCollection(ee.Dictionary(ee.List(samplePointsSet).get(0)).get("nonTailingsPoints")), {color: "red"}, "Non tailings points", false);
+// Map.addLayer(ee.FeatureCollection(ee.Dictionary(ee.List(samplePointsSet).get(0)).get("tailingsPoints")), {color: "green"}, "Training points", false);
 // Map.addLayer(ee.FeatureCollection(ee.Dictionary(ee.List(samplePointsSet).get(9)).get("nonTailingsPoints")), {color: "blue"}, "Non training points");
 // Map.addLayer(ee.FeatureCollection(ee.Dictionary(ee.List(samplePointsSet).get(9)).get("tailingsPoints")), {color: "yellow"}, "Training points");
 
@@ -914,7 +987,7 @@ var variableImportanceList = samplePointsSet.map(function(points){
 });
 //Loop through all variables being used and aggregate stats for each
 var importanceStats = AggregateImportance(variableImportanceList);
-print("Importance Stats", importanceStats);
+// print("Importance Stats", importanceStats);
 //Create list of lists by combining variables with aggregated stats
 var importanceKeys = importanceStats.keys();
 var importanceValues = importanceStats.values().map(function(dict){return ee.Dictionary(dict).get("mean")});
@@ -971,7 +1044,6 @@ function CreateImportanceFeature(variableSet, points){
 function CreateMeanFScoreFeature(variableSet, iterations){
   // Get mean FScore by repeating classification and convert to feature
   variableSet = ee.List([variableSet]).flatten();
-  samplePointsSet = samplePointsSet.shuffle();
   // A list to store features. Indexed to get points from sample collection
   var featureList = ee.List.sequence({start: 0, count: iterations})
     .map(function(n){
@@ -1131,121 +1203,6 @@ if(!useBestBands){
   
   print(bandsString, "Bands Used");
 }
-///////////////////////////////////////////////////////
-//           Object-Based Classification             //
-///////////////////////////////////////////////////////
-
-//Segment objects and classify
-//Intended for use with best variables determined above
-
-//Creates seeds within target district areas based on tailings/non tailings pixels. I.e., not a random, uniform grid
-//targetArea is feature collection of test districts
-//_classBand should be a string. Probably either "tailings" or "classification". Must be integer-typed in range [0,1]
-function CreateTargetedSeeds(targetArea, imageToSegment, classBand){
-  
-  targetArea = ee.FeatureCollection(targetArea);
-  imageToSegment = ee.Image(imageToSegment);
-  
-  //Convert to list to replace features of targetArea FC with FCs of sample points
-  var targetCollectionCount = targetArea.size(); //How many districts or target polygons in target area
-  var targetAreaList = targetArea.toList(targetCollectionCount); //Convert to list of target features
-  
-  //Create sample points
-  var snicFeatureList = targetAreaList.map(function(f){
-  
-    f = ee.Feature(f); //An individual test district
-    
-    //Change sample points based on scale (we want more points at higher resolution)
-    var nonTargetSampleCount = ee.Number(1000).divide(scale).floor(); //E.g., 50 points at 20m, 100 at 10m
-    var targetSampleCount = ee.Number(nonTargetSampleCount).divide(5).floor(); //One fifth of non-target points
-    var sampleSize = ee.List([nonTargetSampleCount, targetSampleCount]);
-    
-    var snicSamples = imageToSegment.stratifiedSample({
-    numPoints: 0, //Overwritten by classPoints
-    classBand: classBand,
-    region: f.geometry(),
-    scale: scale,
-    projection: projection,
-    seed: seedList.shuffle().get(0),
-    classValues: [0, 1],
-    classPoints: sampleSize,
-    geometries: true
-    }).map(function(f){return f.set("Sample", 1)}); //Set variable for image reducer
-    
-    return snicSamples;
-  
-  });
-  
-  //Merge all snic feature points to one FC for reduction to image
-  var snicColl = snicFeatureList.iterate(function(fc, previousFc){
-    
-    fc = ee.FeatureCollection(fc);
-    
-    return fc.merge(previousFc)}, 
-    snicFeatureList.get(0));
-  
-  var snicSeeds = ee.FeatureCollection(snicColl).reduceToImage(["Sample"], ee.Reducer.max())
-  .eq(1)
-  .rename("seeds");
-  
-  return ee.Image(snicSeeds);
-}
-
-//Segment an image and classify it
-function SegmentAndClassify(imageToSegment, seedGrid, variables, targetArea){
-  
-  variables = ee.List(variables);
-  var variablesWithTailings = variables.add("tailings");
-  // Add "tailings" to training image for stratified sampling
-  var trainingImage = imageToSegment.select(variablesWithTailings);
-  //Separate training image and image to be segmented to avoid using "tailings" band in segmentation
-  imageToSegment = ee.Image(imageToSegment).select(variables);
-  
-  //Segment image by growing superpixels from a seeds image
-  var segmented = ee.Algorithms.Image.Segmentation.SNIC({
-    image: imageToSegment, 
-    compactness: 5, 
-    connectivity: 8,
-    neighborhoodSize: 25,
-    seeds: seedGrid
-  });
-  
-  //Assign mean reflectance value of all pixels to superpixels
-  var connectedComponents = segmented.reduceConnectedComponents(ee.Reducer.max(), "clusters")
-    .clip(targetArea);
-  
-  //Superpixel band names have _mean suffix. Replace with regular band names
-  connectedComponents = connectedComponents.rename(variables);
-  
-  //Sample points pixel-wise from whole image. 
-  var trainingSamples = trainingImage.stratifiedSample({
-    numPoints: 0, 
-    classBand: "tailings", 
-    region: imageToSegment.geometry(),
-    scale: scale,
-    projection: projection,
-    seed: 123,
-    classValues: [0,1],
-    classPoints: [5000, 250],
-    dropNulls: true});
-  
-  //Train classifier
-  var connectedClassifier = ee.Classifier.smileRandomForest(250).train(trainingSamples, "tailings");
-  
-  //Classify superpixels
-  var connectedClassified = connectedComponents.classify(connectedClassifier, "classification")
-    .addBands(maskedTailings.rename(["tailings"])) //Add tailings for FScore calculation
-    .reproject({crs: projection, scale: scale});
-  
-  return connectedClassified.eq(1);
-}
-
-// var snicSeeds = CreateTargetedSeeds(testingVector, trainingImage, "tailings");
-// Map.addLayer(snicSeeds.reproject({crs: projection, scale: scale}).selfMask(), null, "Snic Seeds")
-
-// var testSegment = SegmentAndClassify(trainingImage, snicSeeds, testingVector);
-// Map.addLayer(testSegment.selfMask(), {}, "test segmentation");
-
 
 ///////////////////////////////////////////////////////
 //             Pixel-Wise Classification             //
@@ -1292,8 +1249,20 @@ var classifiedImageList = samplePointsSet.map(function(points){
   return ee.Dictionary({
     "classifiedImage": classifiedImage, 
     "accuracy": classifiedAccuracy, 
-    "byDistrict": fScoreByDistricts});
+    "byDistrict": fScoreByDistricts,
+  });
 });
+
+// Shows what variables are being used to classify. Especially important for checking that
+// the tailings band didn't somehow get added here
+// var schemaList = samplePointsSet.map(function(points){
+  
+//     points = ee.Dictionary(points);
+//     var schemaTest = ClassifyFromSamples_SchemaTest(points, variableList)
+//     return schemaTest
+// })
+
+// print(schemaList)
 
 //Go through list where each sample point is a new set of training/testing districts
 //Optimizes variables each time using OOB samples
@@ -1317,8 +1286,10 @@ var classifiedMCOptimized = samplePointsSet.map(function(points){
     "byDistrict": fScoreByDistricts});
 });
 
-//Change to MC list to collect stats
-// classifiedImageList = classifiedMCOptimized;
+//Change to MC list to collect stats if not using optimized bands
+if(!useBestBands){
+  classifiedImageList = classifiedMCOptimized;
+}
 
 //Get accuracy of each image and convert to feature to combine to FC and get stats
 var accuracyStatsFeatures = ee.FeatureCollection(classifiedImageList.map(function(dict){
@@ -1376,94 +1347,324 @@ var classifiedMedian = ee.ImageCollection.fromImages(
 print(accuracyStats, "Overall Accuracy Stats");
 print(districtStats, "Accuracy by District");
 
+// Create image where each pixel is total count of classified tailings
+var classifiedFrequency = ee.ImageCollection.fromImages(
+      classifiedImageList.map(function(dict){return ee.Dictionary(dict).get("classifiedImage")}))
+      .select("classification")
+      .reduce(ee.Reducer.sum())
+      .rename("classificationCount");
+      
+// print(classifiedFrequency);
+
+///////////////////////////////////////////////////////
+//           Object-Based Classification             //
+///////////////////////////////////////////////////////
+
+// Segment objects and classify
+// Intended for use with best variables determined above
+
+// Creates seeds within target district areas based on tailings/non tailings pixels. I.e., not a random, uniform grid
+// targetArea is feature collection of test districts
+// classBand should be a string. Probably either "tailings" or "classification". 
+// Must be integer-typed in range [0,1]
+function CreateTargetedSeeds(targetArea, imageToSegment, classBand, seed){
+  
+  targetArea = ee.FeatureCollection(targetArea);
+  imageToSegment = ee.Image(imageToSegment);
+  classBand = ee.String(classBand);
+  
+  // Convert to list to replace features of targetArea FC with FCs of sample points
+  var targetCollectionCount = targetArea.size(); // How many districts/target polygons in target area
+  var targetAreaList = targetArea.toList(targetCollectionCount); // Convert to list of target features
+  
+  // Create sample points
+  var snicFeatureList = targetAreaList.map(function(f){
+  
+    f = ee.Feature(f); // An individual test district
+    
+    // Change sample points based on scale (we want more points at higher resolution)
+    var nonTargetSampleCount = ee.Number(1000).divide(scale).floor();
+    var targetSampleCount = ee.Number(nonTargetSampleCount).divide(5).floor(); //One fifth of non-target points
+    var sampleSize = ee.List([nonTargetSampleCount, targetSampleCount]);
+
+    var snicSamples = imageToSegment.stratifiedSample({
+    numPoints: 0, // Overridden by classPoints
+    classBand: classBand,
+    region: f.geometry(),
+    scale: scale,
+    projection: projection,
+    seed: seed,
+    classValues: [0, 1],
+    classPoints: sampleSize,
+    geometries: true
+    }).map(function(f){return f.set("Sample", 1)}); // Image reducer needs a value
+    
+    return snicSamples;
+  });
+  
+  //Merge all snic feature points to one FC for reduction to image
+  var snicColl = snicFeatureList.iterate(function(fc, previousFc){
+    
+    fc = ee.FeatureCollection(fc);
+    
+    return fc.merge(previousFc)}, 
+    snicFeatureList.get(0));
+  
+  var snicSeeds = ee.FeatureCollection(snicColl).reduceToImage(["Sample"], ee.Reducer.max())
+  .eq(1)
+  .rename("seeds");
+  
+  return ee.Image(snicSeeds);
+}
+
+//Segment an image and classify it
+function SegmentAndClassify(imageToSegment, seedGrid, variables, targetArea, samplePoints){
+  
+  variables = ee.List(variables);
+  // Unpack sample points
+  samplePoints = ee.Dictionary(samplePoints);
+  var trainingPoints = ee.FeatureCollection(samplePoints.get("nonTailingsPoints"))
+    .merge(ee.FeatureCollection(samplePoints.get("tailingsPoints")));
+  
+  // Add "tailings" to training image for stratified sampling
+  var variablesWithTailings = variables.add("tailings");
+  var trainingImage = imageToSegment.select(variablesWithTailings);
+  // Separate training image and image to be segmented to avoid using "tailings" band in segmentation
+  imageToSegment = ee.Image(imageToSegment).select(variables);
+  
+  // Segment image by growing superpixels from a seeds image
+  var segmented = ee.Algorithms.Image.Segmentation.SNIC({
+    image: imageToSegment, 
+    compactness: 5, 
+    connectivity: 8,
+    neighborhoodSize: 25,
+    seeds: seedGrid
+  });
+  
+  // Assign mean reflectance value of all pixels to superpixels
+  var connectedComponents = segmented.reduceConnectedComponents(ee.Reducer.max(), "clusters")
+    .clip(targetArea);
+  
+  // Superpixel band names have _mean suffix. Replace with regular band names
+  connectedComponents = connectedComponents.rename(variables);
+  
+  // Train classifier
+  var connectedClassifier = ee.Classifier.smileRandomForest(250).train(trainingPoints, "tailings", variables);
+  
+  // Classify superpixels
+  var connectedClassified = connectedComponents.classify(connectedClassifier, "classification")
+    .addBands(maskedTailings.rename(["tailings"])) // Add tailings for FScore calculation
+    .reproject({crs: projection, scale: scale});
+  
+  return connectedClassified.eq(1);
+}
+
+//Get accuracy by district in each image and convert to feature for export
+function objectAccuracyByDistrict(segmentedAndClassifiedList){
+  
+  var districtAccuracies = segmentedAndClassifiedList.map(function(dict){
+    dict = ee.Dictionary(dict);
+    var byDistrict = dict.get("byDistrict");
+    //Get accuracy by district. This is a list of dictionaries
+    var accuracyFeaturesByDistrict = ee.List(byDistrict).map(function(dict){
+      
+      dict = ee.Dictionary(dict);
+      var districtName = dict.get("district");
+      // Get FScore, recall, and precision
+      var accuracyDict = ee.Dictionary(dict.get("accuracy"));
+      var fScore = accuracyDict.get("fScore");
+      var recall = accuracyDict.get("recall");
+      var precision = accuracyDict.get("precision");
+      //Convert to feature for aggregating
+      var districtAccuracyFeature = ee.Feature(null, {
+        "District": districtName, 
+        "FScore": fScore, 
+        "Recall": recall, 
+        "Precision": precision
+      });
+      return districtAccuracyFeature;
+    });
+  
+    return accuracyFeaturesByDistrict;
+  });
+  return ee.FeatureCollection(districtAccuracies.flatten());
+}
+
+//////////////////////////////////////////////
+//          Random Points as Seeds          //
+//////////////////////////////////////////////
+
+// Creates a snic seed image from random points, grows objects from those points, and classifies
+var snicSegmentedRandom = samplePointsSet.map(function(samplePoints){
+  // Sample dictionary contains nonTailingsPoints, tailingsPoints, seed, districtVector
+  samplePoints = ee.Dictionary(samplePoints);
+  // Unpack dictionary
+  var testVector = ee.FeatureCollection(samplePoints.get("districtVector"));
+  var seed = samplePoints.get("seed");
+  // Create random points to convert to snic seed image
+  var snicSeedFeatures = ee.FeatureCollection.randomPoints(testVector, 500, seed)
+    .map(function(point){return point.set("Sample", 1)}); // Property for reducer
+  var snicSeeds = snicSeedFeatures.reduceToImage(["Sample"], ee.Reducer.max());
+  // Segment image using seeds and classify
+  var clustersClassified = SegmentAndClassify(trainingImage, snicSeeds, variableList, testVector, samplePoints);
+  // Get accuracy
+  var accuracy = fScoreByDistrict(clustersClassified, testVector);
+  
+  return ee.Dictionary({"classifiedClusters": ee.Image(clustersClassified), "byDistrict": accuracy});
+});
+
+// print(snicSegmentedRandom)
+
+//Get accuracy by district in each image and convert to feature for export
+// var segmentedFromRandomPoints = objectAccuracyByDistrict(snicSegmentedRandom).aside(print);
+
 //////////////////////////////////////////////
 // Use Pixel-Wise Classification as Seeds   //
 //////////////////////////////////////////////
 
-// var snicSeeds = CreateTargetedSeeds(testingVector, classifiedMedian, "classification");
-// Map.addLayer(snicSeeds.reproject({crs: projection, scale: scale}).selfMask(), {palette: ["blue"]}, "Snic Seeds");
+// Takes sample collection from earlier, classifies each iteration 
+// and then attempts to grow and classify clusters.
+// Returns dictionary of classified image and associated stats
 
-// var clustersClassified = SegmentAndClassify(trainingImage, snicSeeds, variableList, testingVector);
-// Map.addLayer(clustersClassified.select("classification").selfMask(), {palette: ["white", "purple"]}, "Grown Classified Objects", false);
+var snicSegmented = samplePointsSet.map(function(samplePoints){
+  // Sample dictionary contains nonTailingsPoints, tailingsPoints, seed, districtVector
+  samplePoints = ee.Dictionary(samplePoints);
+  // Unpack dictionary
+  var testVector = ee.FeatureCollection(samplePoints.get("districtVector"));
+  var seed = samplePoints.get("seed");
+  // Classify pixel-wise
+  var classified = ClassifyFromSamples(samplePoints, variableList);
+  // Create snic seeds, using classified images
+  var snicSeeds = CreateTargetedSeeds(testVector, classified, "classification", seed);
+  // Segment image using seeds and classify
+  var clustersClassified = SegmentAndClassify(trainingImage, snicSeeds, variableList, testVector, samplePoints);
+  // Get accuracy
+  var accuracy = fScoreByDistrict(clustersClassified, testVector);
+  
+  return ee.Dictionary({"classifiedClusters": ee.Image(clustersClassified), "byDistrict": accuracy});
+});
 
-// var districtAccuracy = fScoreByDistrict(clustersClassified, testingVector);
-// print("Grown Classified Objects FScore:", districtAccuracy);
+//Get accuracy by district in each image and convert to feature for export
+// var segmentedFromRF = objectAccuracyByDistrict(snicSegmented);
+
+// print(clusteredAccuracyByDistrict, "Cluster Accuracy");
 
 //////////////////////////////////////////////
 //          Use Sample Sites as Seeds       //
 //////////////////////////////////////////////
 
-//Known tailings samples can be input and used to grow objects
-//A ring of points will be made around these points,
-//Otherwise the starting object will grow forever
+// Known tailings samples can be input and used to grow objects
+// A cloud of points will be made around these points,
+// Otherwise the starting object will grow forever
 
-//Create seed grid, buffer sample points, remove intersection from seed grid
+// function objectsFromSamples(trainingSamplePoints, fieldSamplePoints, districtName){
   
-// var sampledDistrict = districtsFiltered.filter(ee.Filter.eq("ShortName", "Montague"));
-// //Non-sample points can be created by sampling an image with value = 0
-// var nonSampleImage = ee.Image(0);
-// //Create a regular grid of seeds for non-sample pixels
-// //Some of these will be removed by a buffer around sample pixels
-// var nonSampleSeeds = nonSampleImage.sampleRegions({
-//   collection: sampledDistrict, 
-//   properties: ["Sample"], 
-//   scale: ee.Number(scale).multiply(10),
-//   projection: projection, 
-//   geometries: true})
-//   .map(function(f){return f.set("Sample", 1)});
+//   // District name should be a string of district "shortName", i.e. "Montague"
+//   // Only works on one district. Lazy implementation.
+//   districtName = ee.String(districtName);
+//   //Get feature for sampled district
+//   var sampledDistrict = districtsFiltered.filter(ee.Filter.eq("ShortName", districtName));
   
+//   fieldSamplePoints = ee.FeatureCollection(fieldSamplePoints);
 
-// var bufferedSamples = sampledTailings.map(function(f){
+//   // Generate random seeds across district. Assign "sample" property with value = 1 for reducer
+//   var randomSeeds = ee.FeatureCollection.randomPoints(sampledDistrict, 250)
+//     .map(function(point){return point.set("Sample", 1)});
   
-//   var bufferRange = ee.Number(150);
+//   // Combine sample and non-sample points
+//   var seedFeatures = fieldSamplePoints.merge(randomSeeds);
   
-//   return f.buffer(bufferRange)});
-
-// nonSampleSeeds = nonSampleSeeds.filter(
-//   ee.Filter.bounds(bufferedSamples, 5).not()
-//   );
+//   // Convert to image for SNIC
+//   var snicSeeds = seedFeatures.reduceToImage(["Sample"], ee.Reducer.max())
+//     .reproject({crs: projection, scale: scale});
   
-// var seedFeatures = sampledTailings.merge(nonSampleSeeds);
+//   var objectsClassified = SegmentAndClassify(trainingImage, snicSeeds, variableList, sampledDistrict, trainingSamplePoints);
+//   var objectsFScore = GetAccuracy(objectsClassified, b);
 
-// var sampleSeeds = seedFeatures.reduceToImage(["Sample"], ee.Reducer.count())
-//   .reproject({crs: projection, scale: scale});
+//   return ee.Dictionary({"classifiedImage": objectsClassified, "FScore": objectsFScore});
+// }
 
-// // Map.addLayer(seedFeatures, [], "seed features")
-// // Map.addLayer(bufferedSamples, [], "buffered samples")
-// // Map.addLayer(nonSampleSeeds)
-// // Map.addLayer(sampleSeeds, {min:0, max: 1}, "sample seeds")
-
-// var objectsFromSamples = SegmentAndClassify(trainingImage, sampleSeeds, sampledDistrict);
-// var objectsFScore = GetAccuracy(objectsFromSamples, b).get("fScore");
-
-// print("Sampled Tailings Objects FScore:", objectsFScore);
-// Map.addLayer(objectsFromSamples.select("classification").selfMask(), {palette: ["white", "pink"]}, "Classified from Samples");
-
-/////////////////////////////////////////////
-//       Classify Custom User Area         //
-/////////////////////////////////////////////
-
-// if(userTargetArea){
+// var objectsFromSamplePoints = samplePointsSet.map(function(pointsDict){
   
-//   classificationArea = trainingImage.clip(userTestingVector);
-  
-//   var customAreaClassifiedList = samplePointsSet.map(function(points){
-    
-//     points = ee.Dictionary(points);
-    
-//     var classifiedImage = ClassifyFromSamples(points, bestFScoreVariables, classificationArea);
-    
-//     return classifiedImage;
+//   pointsDict = ee.Dictionary(pointsDict);
+
+//   var classifiedDict = objectsFromSamples(pointsDict, sampledTailingsMO, ee.String(targetDistrictNames.get(0)));
+
+//   return ee.Dictionary(classifiedDict);
+// });
+
+// print(objectsFromSamplePoints)
+// var sampleObjImg = ee.Dictionary(ee.List(objectsFromSamplePoints).get(0)).get("classifiedImage")
+// Map.addLayer(ee.Image(sampleObjImg).select("classification").selfMask(), {palette: ["white", "orange"]}, "Objects from Samples")
+
+// var objectsFromSamplesAccuracy = ee.FeatureCollection(objectsFromSamplePoints.map(function(dict){
+//   dict = ee.Dictionary(dict);
+
+//   var districtName = ee.String(targetDistrictNames.get(0));
+//   var accuracyDict = ee.Dictionary(dict.get("FScore"));
+//   // Get FScore, recall, and precision
+//   var fScore = accuracyDict.get("fScore");
+//   var recall = accuracyDict.get("recall");
+//   var precision = accuracyDict.get("precision");
+//   //Convert to feature for aggregating
+//   var districtAccuracyFeature = ee.Feature(null, {
+//     "District": districtName, 
+//     "FScore": fScore, 
+//     "Recall": recall, 
+//     "Precision": precision
 //   });
   
-//   var customAreaClassified = ee.ImageCollection.fromImages(customAreaClassifiedList)
-//     .select("classification")
-//     .reduce(ee.Reducer.median())
-//     .eq(1);
-    
-//   print(customAreaClassified);
-//   Map.addLayer(customAreaClassified.selfMask(), {palette: ["white", "green"]}, "User's Area Classified");
-// }
+//   return districtAccuracyFeature;
+// }).flatten());
+
+// // print(objectsFromSamplesAccuracy)
+
+// var randomSeeds = ee.FeatureCollection.randomPoints(testingVector.geometry(), 500)
+//   .map(function(point){return point.set("Sample", 1)});
+
+// // Map.addLayer(randomSeeds)
+
+// var randomSeedImg = ee.Algorithms.Image.Segmentation.seedGrid(200);
+
+// // Map.addLayer(randomSeedImg)
+
+/*********************************************
+*                                            * 
+*           Full Image Classifier            *
+*                                            *
+*********************************************/
+function classifyImage(image, samplePoints, variableList){
+  
+  // Unpack sample points
+  samplePoints = ee.Dictionary(samplePoints);
+  var trainingPoints = ee.FeatureCollection(samplePoints.get("nonTailingsPoints"))
+    .merge(ee.FeatureCollection(samplePoints.get("tailingsPoints")));
+
+  // Train classifier
+  var classifier = ee.Classifier.smileRandomForest(250).train(trainingPoints, "tailings", variableList);
+  
+  // Classify superpixels
+  var classified = image.classify(classifier, "classification")
+    .reproject({crs: projection, scale: scale});
+  
+  return classified.eq(1);
+}
+
+var minasImage = s2sr
+  .filterBounds(minas)
+  .filterDate("2019-07-01", "2019-09-01")
+  .sort("CLOUDY_PIXEL_PERCENTAGE")
+  .first();
+  
+var minasNDVI = minasImage.normalizedDifference(["B8", "B4"]).rename("ndvi");
+var minasMNDWI = minasImage.expression("mndwi = (b('B3') - b('B11')) / (b('B3') + b('B11'))").rename("mndwi");
+minasImage = minasImage.addBands(minasNDVI).addBands(minasMNDWI);
+// Map.addLayer(minasImage, {bands: ["B4", "B3", "B2"], min: 50, max: 2000}, "Minas Image")
+
+var trainingPoints = ee.Dictionary(samplePointsSet.get(0)).aside(print);
+var fullImage = classifyImage(trainingImage, trainingPoints, bands20);
+print(fullImage);
+Map.addLayer(fullImage.select("classification").selfMask(), {palette: ["white", "red"]}, "Classified Image");
 
 /*********************************************
 *                                            * 
@@ -1472,19 +1673,54 @@ print(districtStats, "Accuracy by District");
 *********************************************/
 
 // Manually update date and increment testNum
-var exportFolder = "GEE Exports";
-var exportDate = "Jun08"; // No spaces
-var testNum = "02"; // Drive allows repeat names. Make sure this is updated to avoid confusion
-var suffix = exportDate + "_" + testNum; // Filename must be string literal
-var districtExportName = "districtStats_" + suffix;
-var overallAccuracyExportName = "statsPerIteration_" + suffix;
-//Export to Drive
-Export.table.toDrive(accuracyStatsFeaturesByDistrict, "statsPerDistrict", exportFolder, districtExportName);
-if(!useBestBands){
-  // If not using best bands, include band names in feature collection
-  accuracyStatsFeatures = accuracyStatsFeatures.map(function(f){return f.set("Bands", bandsString)}); 
-}
-Export.table.toDrive(accuracyStatsFeatures, "statsPerIteration", exportFolder, overallAccuracyExportName); 
+// var exportFolder = "GEE Exports";
+// var exportDate = "Aug15"; // No spaces
+// var testNum = "02"; // Drive allows repeat names. Make sure this is updated to avoid confusion
+// var suffix = exportDate + "_" + testNum; // Filename must be string literal
+// var districtExportName = "objectsFromRandomGV_" + suffix;
+// var overallAccuracyExportName = "statsPerIteration_" + suffix;
+// //Export to Drive
+// Export.table.toDrive(segmentedFromRandomPoints, "objectsFromRandomPoints", exportFolder, districtExportName);
+// if(!useBestBands){
+//   // If not using best bands, include band names in feature collection
+//   accuracyStatsFeatures = accuracyStatsFeatures.map(function(f){return f.set("Bands", bandsString)}); 
+// }
+// Export.table.toDrive(accuracyStatsFeatures, "statsPerIteration", exportFolder, overallAccuracyExportName);
+
+// Export district buffer zones
+
+//Sample tailings spectra per district and export
+
+// var distMean = MeanDistrictTailingsSpectra(districtsFiltered, trainingImage, bands);
+
+// // Get non-tailings bare soil spectra
+// // SCL 5 is "bare soil" class. Remove tailings from that via mask
+// var bareSoilMask = trainingImage.select("SCL").eq(5).updateMask(tailingsImage.neq(1)).eq(1);
+// var bareSoilSample = trainingImage.updateMask(bareSoilMask)
+//   .select(bands20)
+//   .sample({
+//     region: trainingImage.geometry(), scale: scale, factor: 0.3
+//   });
+  
+// // Get mean for each band as features
+// var bandMeans = bands20.map(function(band){
+//   band = ee.String(band);
+//   var bandMean = bareSoilSample.aggregate_mean(band);
+//   return bandMean;
+// });
+
+// // Combine bands and band means into a dictionary
+// var featureProperties = ee.Dictionary.fromLists(bands20, bandMeans);
+// // Convert to FC for export
+// var bareSoilSpectraFC = ee.FeatureCollection(ee.Feature(null, featureProperties));
+
+// Export.table.toDrive({
+//   collection: distMean,
+//   description: "MeanSpectraMO_Aug2",
+//   folder: exportFolder,
+//   fileNamePrefix: "MeanSpectraMO_Aug2",
+//   fileFormat: "CSV",
+// });
 
 /*********************************************
 *                                            * 
@@ -1508,9 +1744,6 @@ Map.addLayer(maskedTailings.selfMask(), {min: 0, max: 1, palette: ["white", "ora
 //Districts
 Map.addLayer(districtsFiltered.style({color: "black", fillColor: "FF000000"}), null, "Filtered Districts");
 
-//DEM
-// Map.addLayer(DEM, {min: -10, max: 350}, "DEM");
-
 //Normalized Elevation
 // Map.addLayer(ndei, {min: -1, max: 1}, "District Normalized Mean Elevation");
 
@@ -1518,4 +1751,9 @@ Map.addLayer(districtsFiltered.style({color: "black", fillColor: "FF000000"}), n
 // Map.addLayer(classifiedSampleImage.select("classification").selfMask(), {min: 0, max: 1, palette: ["white", "red"]}, "Sample classified image");
 
 //Median of Classified Images
-Map.addLayer(classifiedMedian.select("classification").selfMask(), {min: 0, max: 1, palette: ["white", "red"]}, "Median Classified Tailings");
+// Map.addLayer(classifiedMedian.select("classification").selfMask(), 
+//   {min: 0, max: 1, palette: ["white", "red"]}, "Median Classified Tailings");
+
+// Count of Classified Tailings
+// Map.addLayer(classifiedFrequency.toDouble(), 
+//   {min: 0, max: iterations, palette: ['ffe4e4', 'ff0000']}, "Classified Frequency");
